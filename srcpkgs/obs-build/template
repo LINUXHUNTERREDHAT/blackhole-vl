@@ -1,0 +1,12 @@
+# Template file for 'obs-build'
+pkgname=obs-build
+version=20261016
+revision=1
+build_style=gnu-makefile
+depends="perl"
+short_desc="Script to Build SUSE Linux RPMs"
+maintainer="LINUXHUNTERREDHAT <soyu7658@gmail.com>"
+license="GPL-2.0-or-later"
+homepage="https://github.com/openSUSE/obs-build"
+distfiles="https://github.com/openSUSE/obs-build/archive/refs/tags/${version}.tar.gz"
+checksum=7172186729bfa4098e5e043ccda8b5103fe0d258d6e785e24165b747066067fd

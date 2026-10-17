@@ -1,0 +1,18 @@
+# Template file for 'hyprmoncfg'
+pkgname=hyprmoncfg
+version=1.18.2
+revision=1
+build_style=go
+go_import_path=github.com/crmne/hyprmoncfg
+go_package="./cmd/hyprmoncfg ./cmd/hyprmoncfgd"
+hostmakedepends="go"
+short_desc="Terminal-first monitor configurator and daemon for Hyprland"
+maintainer="Kirilla39 <kirill39.pesin@ya.ru>"
+license="MIT"
+homepage="https://github.com/crmne/hyprmoncfg/"
+distfiles="https://github.com/crmne/hyprmoncfg/archive/v${version}.tar.gz"
+checksum=7b8012ca10c82ee9ba4a985f50354dd9a9201efb7853ef6b2a01a469178547c7
+
+post_install() {
+	vlicense LICENSE
+}

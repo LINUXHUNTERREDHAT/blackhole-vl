@@ -1,0 +1,292 @@
+name: build
+
+on:
+    push:
+        branches:
+            - main
+        paths:
+            - "srcpkgs/**"
+    workflow_dispatch:
+
+jobs:
+    build:
+        name: Build packages
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/void-linux/void-${{ matrix.config.libc }}-full:20250616R1
+            options: --platform ${{ matrix.config.platform }} --privileged
+            volumes:
+                - /dev:/dev
+            env:
+                ARCH: "${{ matrix.config.arch }}"
+                BOOTSTRAP: "${{ matrix.config.host }}"
+                TEST: "${{ matrix.config.test }}"
+        strategy:
+            fail-fast: false
+            matrix:
+                config:
+                    - {
+                          arch: x86_64,
+                          host: x86_64,
+                          libc: glibc,
+                          platform: linux/amd64,
+                          test: 1,
+                      }
+                    - {
+                          arch: aarch64,
+                          host: x86_64,
+                          libc: glibc,
+                          platform: linux/amd64,
+                          test: 0,
+                      }
+                    - {
+                          arch: x86_64-musl,
+                          host: x86_64-musl,
+                          libc: musl,
+                          platform: linux/amd64,
+                          test: 1,
+                      }
+                    - {
+                          arch: aarch64-musl,
+                          host: x86_64-musl,
+                          libc: musl,
+                          platform: linux/amd64,
+                          test: 0,
+                      }
+
+        permissions:
+            contents: write
+
+        steps:
+            - name: Prepare container
+              run: |
+                  # switch to repo-ci mirror
+                  mkdir -p /etc/xbps.d && cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/
+                  sed -i 's|repo-default|repo-ci|g' /etc/xbps.d/*-repository-*.conf
+                  # install dependencies
+                  xbps-install -Syu xbps && xbps-install -yu && xbps-install -y sudo bash curl git rsync openssh
+                  # create non-root user
+                  useradd -G xbuilder -M builder
+
+            - name: Checkout this repo
+              run: |
+                  git clone --depth 1 --single-branch -b main "https://github.com/${{ github.repository }}.git" extra
+                  cd extra
+                  # we need the previous revision to diff against
+                  if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+                      git fetch --no-tags origin "${{ github.event.before }}" --depth 1 || true
+                  fi
+                  git fetch --no-tags origin "${{ github.sha }}" --depth 1
+                  git checkout --detach "${{ github.sha }}"
+
+            - name: Determine changed templates
+              id: changed
+              run: |
+                  cd extra
+
+                  base="${{ github.event.before }}"
+                  tip="${{ github.sha }}"
+
+                  if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+                      changed_pkgs=$(find srcpkgs -maxdepth 1 -mindepth 1 -type d -printf "%f\n" \
+                        | tr '\n' ' ')
+                      removed_pkgs=""
+                  else
+                      changed_pkgs=$(git diff --name-only "$base" "$tip" --diff-filter=AM -- 'srcpkgs/*/template' \
+                          | cut -d/ -f2 \
+                          | sort -u \
+                          | tr '\n' ' ')
+                      
+                      removed_pkgs=$(git diff --name-status "$base" "$tip" -- 'srcpkgs/*/template' \
+                          | awk '$1=="D"{print $2}' \
+                          | cut -d/ -f2 \
+                          | sort -u \
+                          | tr '\n' ' ')
+                  fi
+
+                  changed_pkgs="${changed_pkgs%% }"
+                  removed_pkgs="${removed_pkgs%% }"
+
+                  echo "Changed templates: ${changed_pkgs:-<none>}"
+                  echo "Removed templates: ${removed_pkgs:-<none>}"
+
+                  echo "pkgs=$changed_pkgs" >> "$GITHUB_OUTPUT"
+                  echo "removed=$removed_pkgs" >> "$GITHUB_OUTPUT"
+
+            - name: Checkout void-packages
+              run: |
+                  git clone --depth 1 https://github.com/void-linux/void-packages.git void-packages
+                  cd void-packages
+                  git checkout --detach master
+
+            - name: Merge templates and edit shlibs
+              run: |
+                  echo "==> copying templates..."
+                  cp -rv extra/srcpkgs/* void-packages/srcpkgs/
+
+                  SHLIBS_FILE="void-packages/common/shlibs"
+                  APPEND_FILE="extra/shlibs_append"
+                  REMOVE_FILE="extra/shlibs_remove"
+
+                  echo "==> updating common/shlibs..."
+                  if [ -f "$REMOVE_FILE" ]; then
+                      while IFS= read -r line; do
+                          [ -z "$line" ] && continue
+                          grep -vF "$line" "$SHLIBS_FILE" > "$SHLIBS_FILE.tmp" && mv "$SHLIBS_FILE.tmp" "$SHLIBS_FILE"
+                          echo "   - removed: $line"
+                      done < "$REMOVE_FILE"
+                  fi
+
+                  if [ -f "$APPEND_FILE" ]; then
+                      while IFS= read -r line; do
+                          [ -z "$line" ] && continue
+                          if ! grep -qF "$line" "$SHLIBS_FILE"; then
+                              echo "$line" >> "$SHLIBS_FILE"
+                              echo "   + added: $line"
+                          fi
+                      done < "$APPEND_FILE"
+                  fi
+
+                  echo "=> applying inline edits..."
+                  if [ -d "void-packages/srcpkgs/hyprutils/patches" ]; then
+                      echo "   - removing void-packages/srcpkgs/hyprutils/patches"
+                      rm -rf void-packages/srcpkgs/hyprutils/patches
+                  fi
+
+            - name: Prepare masterdir
+              env:
+                  PUBLIC_KEY_OF_XBPS_REPO: ${{ secrets.PUBLIC_KEY_OF_XBPS_REPO }}
+                  PUBLIC_KEY_OF_XBPS_REPO_NAME: ${{ secrets.PUBLIC_KEY_OF_XBPS_REPO_NAME }}
+              run: |
+                  cd void-packages
+                  
+                  # adding black-hole mirror to conf
+                  sed -i '1i repository=https://mirror.black-hole.dev/x86_64' \
+                      etc/xbps.d/repos-remote.conf
+                  sed -i '1i repository=https://mirror.black-hole.dev/x86_64-musl' \
+                      etc/xbps.d/repos-remote-musl.conf
+                  sed -i '1i repository=https://mirror.black-hole.dev/aarch64' \
+                      etc/xbps.d/repos-remote-aarch64.conf
+                  sed -i '1i repository=https://mirror.black-hole.dev/aarch64-musl' \
+                      etc/xbps.d/repos-remote-aarch64-musl.conf
+                  printf '%s' "$PUBLIC_KEY_OF_XBPS_REPO" | base64 -d \
+                    > "common/repo-keys/$PUBLIC_KEY_OF_XBPS_REPO_NAME"
+
+                  chown -R builder:builder . &&
+                  sudo -Eu builder common/travis/set_mirror.sh &&
+                  sudo -Eu builder common/travis/prepare.sh &&
+                  common/travis/fetch-xtools.sh
+
+            - name: Build
+              id: build_step
+              run: |
+                  export PATH="/opt/xbps/usr/bin/:$PATH"
+                  cd void-packages
+
+                  changed="${{ steps.changed.outputs.pkgs }}"
+                  removed="${{ steps.changed.outputs.removed }}"
+
+                  if [ -z "$changed" ]; then
+                      echo "No changed templates, skipping build."
+                      echo "built=" >> "$GITHUB_OUTPUT"
+                      echo "failed=" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  if [ "$BOOTSTRAP" != "$ARCH" ]; then
+                      arch="-a $ARCH"
+                  fi
+
+                  if [ "$TEST" = 1 ]; then
+                      test="-Q"
+                  fi
+
+                  PKGS=$(sudo -Eu builder ./xbps-src $test sort-dependencies $changed)
+                  built=""
+                  failed=""
+
+                  for pkg in ${PKGS}; do
+                      if sudo -Eu builder ./xbps-src -j"$(nproc)" -s $arch $test pkg "${pkg}"; then
+                          built="$built $pkg"
+                      else
+                          echo "!! build failed for ${pkg}"
+                          failed="$failed $pkg"
+                      fi
+                  done
+
+                  built="${built%% }"
+                  failed="${failed%% }"
+
+                  echo "Built packages: ${built:-<none>}"
+                  echo "Failed packages: ${failed:-<none>}"
+
+                  echo "built=$built" >> "$GITHUB_OUTPUT"
+                  echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+            - name: Setup SSH
+              if: ${{ steps.changed.outputs.pkgs != '' || steps.changed.outputs.removed != '' }}
+              env:
+                  SSH_PRIV: ${{ secrets.SSH_PRIV }}
+                  SSH_MIRROR_SECRET_KEY_NAME: ${{ secrets.SSH_MIRROR_SECRET_KEY_NAME }}
+                  SSH_MIRROR_HOST: ${{ secrets.SSH_MIRROR_HOST }}
+                  SSH_MIRROR_PORT: ${{ secrets.SSH_MIRROR_PORT }}
+              run: |
+                  set -eux
+                  mkdir -p /home/builder/.ssh
+                  printf "%s\n" "$SSH_PRIV" > "/home/builder/.ssh/${SSH_MIRROR_SECRET_KEY_NAME}"
+                  chmod 700 /home/builder/.ssh
+                  chmod 600 "/home/builder/.ssh/$SSH_MIRROR_SECRET_KEY_NAME"
+                  ssh-keyscan -p "${SSH_MIRROR_PORT}" "${SSH_MIRROR_HOST}" > "/home/builder/.ssh/known_hosts"
+                  chmod 644 /home/builder/.ssh/known_hosts
+                  chown -R builder:builder /home/builder/.ssh
+
+            - name: Upload built packages
+              if: ${{ steps.changed.outputs.pkgs != '' || steps.changed.outputs.removed != '' }}
+              working-directory: void-packages/hostdir/binpkgs
+              env:
+                  SSH_MIRROR_SECRET_KEY_NAME: ${{ secrets.SSH_MIRROR_SECRET_KEY_NAME }}
+                  SSH_MIRROR_USER: ${{ secrets.SSH_MIRROR_USER }}
+                  SSH_MIRROR_HOST: ${{ secrets.SSH_MIRROR_HOST }}
+                  SSH_MIRROR_PORT: ${{ secrets.SSH_MIRROR_PORT }}
+                  SSH_MIRROR_HOME: ${{ secrets.SSH_MIRROR_HOME }}
+                  XBPS_ARCH: ${{ matrix.config.arch }}
+
+              run: |
+                  set -eu
+
+                  mkdir -p /tmp/upload
+
+                  cp -v ./*.xbps /tmp/upload/ 2>/dev/null || true
+
+                  printf "%s\n" "${{ steps.changed.outputs.removed }}" \
+                      | tr ' ' '\n' \
+                      > /tmp/upload/removed.txt
+
+                  sudo -Eu builder rsync -avz --ignore-existing \
+                      -e "ssh -p $SSH_MIRROR_PORT \
+                      -i /home/builder/.ssh/$SSH_MIRROR_SECRET_KEY_NAME \
+                      -o StrictHostKeyChecking=no \
+                      -o BatchMode=yes" \
+                      /tmp/upload/ \
+                      "${SSH_MIRROR_USER}@${SSH_MIRROR_HOST}:$SSH_MIRROR_HOME/INCOMING/${XBPS_ARCH}/"
+
+            - name: Deploy repository on mirror
+              if: ${{ steps.changed.outputs.pkgs != '' || steps.changed.outputs.removed != '' }}
+              env:
+                  SSH_MIRROR_SECRET_KEY_NAME: ${{ secrets.SSH_MIRROR_SECRET_KEY_NAME }}
+                  SSH_MIRROR_USER: ${{ secrets.SSH_MIRROR_USER }}
+                  SSH_MIRROR_HOST: ${{ secrets.SSH_MIRROR_HOST }}
+                  SSH_MIRROR_PORT: ${{ secrets.SSH_MIRROR_PORT }}
+                  SSH_MIRROR_HOME: ${{ secrets.SSH_MIRROR_HOME }}
+                  MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
+                  XBPS_ARCH: ${{ matrix.config.arch }}
+              run: |
+                  set -eu
+                      
+                  sudo -Eu builder ssh \
+                      -p "$SSH_MIRROR_PORT" \
+                      -i "/home/builder/.ssh/$SSH_MIRROR_SECRET_KEY_NAME" \
+                      -o StrictHostKeyChecking=no \
+                      -o BatchMode=yes \
+                      "${SSH_MIRROR_USER}@${SSH_MIRROR_HOST}" \
+                      "${SSH_MIRROR_HOME}/sing-packages.sh '$XBPS_ARCH' '$MIRROR_PATH'"
